@@ -73,6 +73,8 @@ class MokioMindConfig(PretrainedConfig):
 
 import torch
 import torch.nn as nn
+import math
+from typing import Optional
 
 # RMSNORM
 # inherit nn.Module
@@ -92,3 +94,81 @@ class RMSNorm(nn.Module):
     #forward
     def forward(self,x):
         return self.weight*self._norm(x.float().type_as(x))
+
+# 1. 预计算 YaRN 频率
+def precompute_freqs_cis(dim: int, end: int = 32*1024, rope_base: float = 10000.0, rope_scaling: Optional[dict] = None):
+    # 修正语法错误，移除多余的切片
+    freqs = 1.0 / (rope_base ** (torch.arange(0, dim, 2).float() / dim))
+    attn_factor = 1.0
+    
+    if rope_scaling is not None:
+        orig_max = rope_scaling['original_max_position_embeddings']
+        factor = rope_scaling['factor']
+        beta_fast = rope_scaling['beta_fast']
+        beta_slow = rope_scaling['beta_slow']
+
+        # 推断的长度大于训练长度，使用缩放
+        if end > orig_max:
+            inv_dim = lambda b: (dim * math.log(orig_max / (b * 2 * math.pi))) / (2 * math.log(rope_base))
+
+            # 划分高低维度边界
+            low = max(math.floor(inv_dim(beta_fast)), 0)
+            high = min(math.ceil(inv_dim(beta_slow)), dim // 2 - 1)
+
+            # 计算缩放因子，处理平滑过渡
+            ramp = torch.clamp(
+                (torch.arange(dim // 2, device=freqs.device).float() - low) / max(high - low, 0.001),
+                0,
+                1,
+            )
+
+            # 对频率进行线性插值缩放
+            freqs = freqs * (1 - ramp + ramp / factor)
+            
+            # 【补充】YaRN 的 Attention 缩放因子 (mscale)
+            # 作用是修正拓展上下文后的注意力分布熵变
+            mscale = 0.1 * math.log(factor) + 1.0
+            attn_factor = mscale # 将乘在 cos 和 sin 上
+
+    # 【修复缩进】无论是否缩放，都必须执行以下生成位置索引的逻辑
+    t = torch.arange(end, device=freqs.device).float()
+
+    # 计算外积 (end, dim//2)
+    freqs = torch.outer(t, freqs).float()
+
+    # 拼接并应用 attn_factor (end, dim)
+    freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=1) * attn_factor
+    freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=1) * attn_factor
+
+    return freqs_cos, freqs_sin
+
+# 2. 应用 RoPE
+def apply_rope(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+    # 旋转一半的维度: [a, b, c, d] -> [-c, -d, a, b] 
+    # (假设 LLaMA 风格的 interleave 方式，前半和后半分别对应)
+    def rotate_half(x):
+        return torch.cat(
+            (-x[..., x.shape[-1] // 2:], x[..., :x.shape[-1] // 2]), dim=-1
+        )
+    
+    # 【修复】必须根据 position_ids 提取对应的位置！
+    if position_ids is not None:
+        # cos 形状变为 (batch_size, seq_len, dim)
+        cos = cos[position_ids]
+        sin = sin[position_ids]
+    else:
+        # 如果没有传入 position_ids，默认按 q 的 seq_len 截断
+        # 假设 q 的形状为 (batch, seq_len, num_heads, head_dim)
+        seq_len = q.shape[1] 
+        cos = cos[:seq_len]
+        sin = sin[:seq_len]
+
+    # 给 cos 和 sin 增加维度以匹配 q, k (通常在 head 的维度扩充)
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+
+    # 核心公式：x_rotated = x * cos + rotate_half(x) * sin
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+
+    return q_embed, k_embed
