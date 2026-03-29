@@ -70,3 +70,25 @@ class MokioMindConfig(PretrainedConfig):
             if self.inference_rope_scaling
             else None
         )
+
+import torch
+import torch.nn as nn
+
+# RMSNORM
+# inherit nn.Module
+class RMSNorm(nn.Module):
+    #dim: 维度；eps：norm所需极小值
+    def _init_(self, dim: int, eps: 1e-5):
+        super().__init__()
+        self.dim = dim
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    #norm
+    def _norm(self, x):
+        return torch.rsqrt(x.pow(2).mean(-1, keepdim = True)+self.eps) * x
+        
+
+    #forward
+    def forward(self,x):
+        return self.weight*self._norm(x.float().type_as(x))
