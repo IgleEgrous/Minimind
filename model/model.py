@@ -1,8 +1,8 @@
 from transformers import PretrainedConfig
 
 
-class MokioMindConfig(PretrainedConfig):
-    model_type = "mokiomind"
+class MiniMindConfig(PretrainedConfig):
+    model_type = "minimind"
 
     def __init__(
         self,
@@ -74,15 +74,17 @@ class MokioMindConfig(PretrainedConfig):
 import torch
 import torch.nn as nn
 import math
-from typing import Optional,Tuple
+from typing import Optional,Tuple,Union
 from torch.nn import functional as F
-from .activation_functions import ACT2FN
+from transformers.activations import ACT2FN
+from transformers import PreTrainedModel, GenerationMixin
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 # RMSNORM
 # inherit nn.Module
 class RMSNorm(nn.Module):
     #dim: 维度；eps：norm所需极小值
-    def _init_(self, dim: int, eps: 1e-5):
+    def __init__(self, dim: int, eps:float=1e-5):
         super().__init__()
         self.dim = dim
         self.eps = eps
@@ -90,12 +92,12 @@ class RMSNorm(nn.Module):
 
     #norm
     def _norm(self, x):
-        return torch.rsqrt(x.pow(2).mean(-1, keepdim = True)+self.eps) * x
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
         
 
     #forward
     def forward(self,x):
-        return self.weight*self._norm(x.float().type_as(x))
+        return self.weight*self._norm(x.float()).type_as(x)
 
 # 1. 预计算 YaRN 频率
 def precompute_freqs_cis(dim: int, end: int = 32*1024, rope_base: float = 10000.0, rope_scaling: Optional[dict] = None):
@@ -239,7 +241,7 @@ class Attention(nn.Module):
         # 提取 RoPE
         cos, sin = position_embedding
         # 修复：sq 改为 xq，修复切片传参语法
-        xq, xk = self.apply_rotary_pos_emb(xq, xk, cos[:seq_len], sin[:seq_len])
+        xq, xk = apply_rope(xq, xk, cos[:seq_len], sin[:seq_len])
         
         # KV Cache 逻辑
         if past_key_value is not None:
@@ -298,7 +300,7 @@ class Attention(nn.Module):
 
 #FFN
 class FeedForward(nn.Module):
-    def __init__(self, args:MokioMindConfig):
+    def __init__(self, args:MiniMindConfig):
         super().__init__()
         if args.intermediate_size is None:
             intermediate_size=int(args.hidden_size*8/3)
@@ -320,7 +322,7 @@ class FeedForward(nn.Module):
 
 #拼接GQA和FFN
 class MiniMindBlock(nn.Module):
-    def __init__(self, layer_id:int, args:MokioMindConfig):
+    def __init__(self, layer_id:int, args:MiniMindConfig):
         super().__init__()
         self.num_attention_heads = args.num_attention_heads
         self.hidden_size = args.hidden_size
@@ -345,3 +347,116 @@ class MiniMindBlock(nn.Module):
         hidden_states = hidden_states + self.mlp(self.post_attn_layernorm(hidden_states))
 
         return hidden_states, present_key_value
+    
+
+#组装模型
+class MiniMindModel(nn.Module):
+    def __init__(self, config:MiniMindConfig):
+        super().__init__()
+        self.vocab_size,self.num_hidden_layers=(
+            config.vocab_size,
+            config.num_hidden_layers,
+        )
+        self.embed_tokens=nn.Embedding(config.vocab_size,config.hidden_size)
+        self.dropout=nn.Dropout(config.dropout)
+        self.layers=nn.ModuleList(
+            [MiniMindBlock(i,config) for i in range(self.num_hidden_layers)]
+        )
+        self.norm=RMSNorm(config.hidden_size,eps=config.rms_norm_eps)
+
+        #Rope预计算
+        freqs_cos, freqs_sin = precompute_freqs_cis(
+            dim=config.hidden_size // config.num_attention_heads,
+            end=config.max_position_embeddings,
+            rope_base=config.rope_theta,
+            rope_scaling=config.rope_scaling,
+        )
+
+        self.register_buffer('freq_cos', freqs_cos, persistent=False)
+        self.register_buffer('freq_sin', freqs_sin, persistent=False)
+
+    def forward(
+            self,
+            input_ids:Optional[torch.Tensor]=None,
+            attention_mask:Optional[torch.Tensor]=None,
+            past_key_values:Optional[Tuple[Tuple[torch.Tensor]]]=None,
+            use_cache:bool=False,
+            **kwargs):
+        
+        batch_size,seq_len  = input_ids.shape
+
+        if hasattr(past_key_values,'layers'):
+            past_key_values=None
+
+        past_key_values=past_key_values or [None]*len(self.layers)
+
+        start_pos=(
+            past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
+        )
+
+        hidden_states = self.dropout(self.embed_tokens(input_ids))
+        position_embeddings=(
+            self.freq_cos[start_pos:start_pos+seq_len],
+            self.freq_sin[start_pos:start_pos+seq_len],
+        )
+        presents=[]
+        for layer_idx,(layer,past_key_values) in enumerate(
+            zip(self.layers,past_key_values)
+        ):
+            hidden_states,present=layer(
+                hidden_states,
+                position_embeddings,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                attention_mask=attention_mask,
+            )
+
+            presents.append(present)
+
+        hidden_states=self.norm(hidden_states)
+
+        return hidden_states,presents
+    
+#封装模型
+class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
+    config_class = MiniMindConfig
+
+    def __init__(self, config:MiniMindConfig):
+        super.config=config
+        super().__init__(config)
+
+        self.model=MiniMindModel(config)
+
+        self.lm_head=nn.Linear(
+            self.config.hidden_size,self.config.vocab_size,bias=False
+        )
+        #权重共享，输出层的权重和嵌入层的权重共享
+        self.model.embed_tokens.weight=self.lm_head.weight
+        self.OUT=CausalLMOutputWithPast()
+
+    def forward(self, input_ids:Optional[torch.Tensor]=None,
+                attention_mask:Optional[torch.Tensor]=None,
+                past_key_values:Optional[Tuple[Tuple[torch.Tensor]]]=None,
+                use_cache:bool=False,
+                logits_to_keep:Union[int,torch.Tensor]=0,
+                **args):
+        hidden_states,past_key_values=self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                **args
+        )
+        #如果logits_to_keep是整数则保留最后n个位置
+        slice_indices=(slice(-logits_to_keep,None)
+                       if isinstance(logits_to_keep,int)
+                       else logits_to_keep
+                       )
+        logits=self.lm_head(hidden_states[:,slice_indices,:])
+
+        # 在 forward 内部直接 return，不再通过 self.OUT 中转
+        return CausalLMOutputWithPast(
+            hidden_state=hidden_states,
+            logits=logits,
+            past_key_values=past_key_values
+        )
