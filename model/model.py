@@ -317,3 +317,31 @@ class FeedForward(nn.Module):
     #向前传播
     def forward(self,x):
         return self.dropout(self.down_proj(self.act_fn(self.gate_proj(x))*self.up_proj(x)))
+
+#拼接GQA和FFN
+class MiniMindBlock(nn.Module):
+    def __init__(self, layer_id:int, args:MokioMindConfig):
+        super().__init__()
+        self.num_attention_heads = args.num_attention_heads
+        self.hidden_size = args.hidden_size
+        self.head_dim = self.hidden_size // self.num_attention_heads
+        self.self_attn = Attention(args)
+
+        self.layer_id = layer_id
+        self.input_layernorm = RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.post_attn_layernorm = RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.mlp = FeedForward(args)
+
+    #向前传播
+    def forward(self, hidden_states,position_embeddings,past_key_value=None,
+                use_cache=False,attention_mask=None):
+        #残差化
+        residual = hidden_states
+        hidden_states,present_key_value=self.self_attn(
+            self.input_layernorm(hidden_states),position_embeddings,past_key_value,
+            use_cache,attention_mask
+        )
+        hidden_states = residual + hidden_states
+        hidden_states = hidden_states + self.mlp(self.post_attn_layernorm(hidden_states))
+
+        return hidden_states, present_key_value
