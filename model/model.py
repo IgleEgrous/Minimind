@@ -432,7 +432,7 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
         )
         #权重共享，输出层的权重和嵌入层的权重共享
         self.model.embed_tokens.weight=self.lm_head.weight
-        self.OUT=CausalLMOutputWithPast()
+        # self.OUT=CausalLMOutputWithPast()
 
     def forward(self, input_ids:Optional[torch.Tensor]=None,
                 attention_mask:Optional[torch.Tensor]=None,
@@ -456,7 +456,7 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
 
         # 在 forward 内部直接 return，不再通过 self.OUT 中转
         return CausalLMOutputWithPast(
-            hidden_state=hidden_states,
             logits=logits,
-            past_key_values=past_key_values
+            past_key_values=past_key_values,
+            hidden_state=hidden_states,
         )
