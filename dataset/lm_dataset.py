@@ -23,7 +23,7 @@ class PretrainDataset(Dataset):
     def __getitem__(self, index):
         sample=self.samples[index]
         # tokenizer把文本转化为input_id，
-        tokens=self.tokenizer(uv 
+        tokens=self.tokenizer( 
             str(sample['text']),#假设jsonl有‘text’字段并包含在文本中
             add_special_tokens=False,
             max_length=self.max_length-2,#留出位置给BOS和EOS
