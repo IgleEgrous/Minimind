@@ -439,6 +439,7 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
                 past_key_values:Optional[Tuple[Tuple[torch.Tensor]]]=None,
                 use_cache:bool=False,
                 logits_to_keep:Union[int,torch.Tensor]=0,
+                labels:Optional[torch.Tensor]=None,
                 **args):
         hidden_states,past_key_values=self.model(
                 input_ids=input_ids,
@@ -454,9 +455,18 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
                        )
         logits=self.lm_head(hidden_states[:,slice_indices,:])
 
+        loss = None
+        if labels is not None:
+            # 计算 CE Loss，忽略 labels==-100 的位置
+            loss_fct = torch.nn.CrossEntropyLoss(ignore_index=-100)
+            loss = loss_fct(logits.view(-1, logits.size(-1)), labels.view(-1))
+
         # 在 forward 内部直接 return，不再通过 self.OUT 中转
+        # aux_loss=0 因为 MiniMind 没有实现 MoE
         return CausalLMOutputWithPast(
+            loss=loss,
             logits=logits,
             past_key_values=past_key_values,
             hidden_state=hidden_states,
+            aux_loss=torch.tensor(0.0, device=logits.device) if loss is not None else None,
         )

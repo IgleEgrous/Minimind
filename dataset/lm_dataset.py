@@ -44,9 +44,5 @@ class PretrainDataset(Dataset):
         attention_mask=(input_ids != self.tokenizer.pad_token_id).long()
 
         #输出input_ids, attention_mask, labels
-        return {
-            'input_ids': input_ids,
-            'attention_mask': attention_mask,
-            'labels': labels
-        }
+        return input_ids, labels, attention_mask
     
